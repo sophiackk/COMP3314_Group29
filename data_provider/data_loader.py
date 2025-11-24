@@ -242,12 +242,15 @@ class Dataset_Custom(Dataset):
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
 
+        if 'date' not in df_raw.columns:
+            df_raw['date'] = np.arange(len(df_raw))
+
         '''
         df_raw.columns: ['date', ...(other features), target feature]
         '''
         cols = list(df_raw.columns)
-        
-        cols.remove('date')
+        if 'date' in cols:
+            cols.remove('date')
         if self.target in cols:
             cols.remove(self.target)
             df_raw = df_raw[['date'] + cols + [self.target]]
@@ -293,7 +296,7 @@ class Dataset_Custom(Dataset):
             self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
 
         self.data_stamp = data_stamp
-
+        
     def __getitem__(self, index):
         s_begin = index
         s_end = s_begin + self.seq_len
