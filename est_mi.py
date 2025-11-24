@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import torch
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
 from exp.exp_imputation import Exp_Imputation
@@ -10,8 +11,57 @@ from utils.print_args import print_args
 import random
 import numpy as np
 
-def replace_each_feature(batch_x, replacements,mask,device):
 
+def convert_token_to_float(token: str) -> float:
+    if not token.isdigit():
+        raise ValueError(f"Expected numeric token, got '{token}'")
+    value = int(token)
+    if len(token) >= 3:
+        return value / 100.0
+    return value / 10.0
+
+
+def format_decimal(value: float, decimals: int) -> str:
+    fmt = f"{{:.{decimals}f}}".format(value)
+    fmt = fmt.rstrip('0').rstrip('.') if '.' in fmt else fmt
+    if '.' not in fmt:
+        fmt = f"{fmt}.0"
+    return fmt
+
+
+def build_synthetic_checkpoint_prefix(args) -> str | None:
+    pattern = re.compile(
+        rf'^{re.escape(args.model)}_g(?P<gamma>\d+)_a(?P<alpha>\d+)_p(?P<pred>\d+)$'
+    )
+    match = pattern.match(args.model_id)
+    if not match:
+        return None
+
+    gamma_token = match.group('gamma')
+    alpha_token = match.group('alpha')
+    pred_token = int(match.group('pred'))
+
+    if pred_token != args.pred_len:
+        print(
+            f"[Warning] pred_len ({args.pred_len}) does not match p{pred_token} in model_id."
+        )
+
+    gamma_value = convert_token_to_float(gamma_token)
+    alpha_value = convert_token_to_float(alpha_token)
+
+    gamma_decimals = 2 if len(gamma_token) >= 3 else 1
+    gamma_str = format_decimal(gamma_value, gamma_decimals)
+
+    alpha_decimals = 2 if len(alpha_token) >= 3 else 1
+    alpha_str = format_decimal(alpha_value, alpha_decimals)
+
+    return (
+        f"long_term_forecast_{args.model}_"
+        f"gamma{gamma_str}_alpha{alpha_str}_pred{args.pred_len}_{args.model}"
+    )
+
+
+def replace_each_feature(batch_x, replacements, mask, device):
     X_expanded = batch_x.unsqueeze(1).expand(-1, args.enc_in, -1, -1)
     replacements = replacements.to(device)
     X_expanded = X_expanded.to(device)
@@ -19,11 +69,13 @@ def replace_each_feature(batch_x, replacements,mask,device):
     X_replaced = torch.where(mask, replacements, X_expanded)
     return X_replaced
 
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='TimesNet')
 
-    # basic config
+    # (all argument definitions unchanged)
+    # --- basic config ---
     parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
                         help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
@@ -31,32 +83,32 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, required=True, default='Autoformer',
                         help='model name, options: [Autoformer, Transformer, TimesNet]')
 
-    # data loader
+    # --- data loader ---
     parser.add_argument('--data', type=str, required=True, default='ETTm1', help='dataset type')
     parser.add_argument('--root_path', type=str, default='./data/ETT/', help='root path of the data file')
     parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
     parser.add_argument('--features', type=str, default='M',
-                        help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
+                        help='forecasting task, options:[M, S, MS]')
     parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
     parser.add_argument('--freq', type=str, default='h',
-                        help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
+                        help='freq for time features encoding')
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
     parser.add_argument('--load2device', action='store_true', help='load whole dataset to device', default=False)
 
-    # forecasting task
+    # --- forecasting task ---
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
     parser.add_argument('--label_len', type=int, default=48, help='start token length')
     parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
 
-    # inputation task
+    # --- imputation task ---
     parser.add_argument('--mask_rate', type=float, default=0.25, help='mask ratio')
 
-    # anomaly detection task
+    # --- anomaly detection task ---
     parser.add_argument('--anomaly_ratio', type=float, default=0.25, help='prior anomaly ratio (%)')
 
-    # model define
+    # --- model define ---
     parser.add_argument('--expand', type=int, default=2, help='expansion factor for Mamba')
     parser.add_argument('--d_conv', type=int, default=4, help='conv kernel size for Mamba')
     parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
@@ -72,55 +124,54 @@ if __name__ == '__main__':
     parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average')
     parser.add_argument('--factor', type=int, default=1, help='attn factor')
     parser.add_argument('--distil', action='store_false',
-                        help='whether to use distilling in encoder, using this argument means not using distilling',
                         default=True)
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--embed', type=str, default='timeF',
-                        help='time features encoding, options:[timeF, fixed, learned]')
+                        help='time features encoding')
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
-    parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
+    parser.add_argument('--output_attention', action='store_true', help='whether to output attention in encoder')
     parser.add_argument('--channel_independence', type=int, default=1,
                         help='0: channel dependence 1: channel independence for FreTS model')
-    parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize; True 1 False 0')
+    parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize')
     parser.add_argument('--down_sampling_layers', type=int, default=0, help='num of down sampling layers')
     parser.add_argument('--down_sampling_window', type=int, default=1, help='down sampling window size')
     parser.add_argument('--down_sampling_method', type=str, default=None,
-                        help='down sampling method, only support avg, max, conv')
+                        help='down sampling method')
     parser.add_argument('--seg_len', type=int, default=48,
-                        help='the length of segmen-wise iteration of SegRNN')
+                        help='seg length for SegRNN')
     parser.add_argument('--no_skip', default=False, action="store_true", help="NO skip connection in transformer")
     parser.add_argument('--fuse_decoder', default=False, action="store_true", help="Add a fuse layer to decoder projection")
-    parser.add_argument('--decoder_type', type=str, default='conv2d', help="the type of the fuse layer in decoder projection, can be conv2d and MLP")
-    
-    # optimization
+    parser.add_argument('--decoder_type', type=str, default='conv2d', help="decoder projection type")
+
+    # --- optimization ---
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
+    parser.add_argument('--batch_size', type=int, default=32, help='batch size')
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
-    parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.0001, help='lr')
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--loss', type=str, default='MSE', help='loss function')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
-    parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
+    parser.add_argument('--use_amp', action='store_true', help='use AMP', default=False)
 
-    # GPU
+    # --- GPU ---
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
     parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
-    parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
+    parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids')
 
-    # de-stationary projector params
+    # --- de-stationary projector params ---
     parser.add_argument('--p_hidden_dims', type=int, nargs='+', default=[128, 128],
-                        help='hidden layer dimensions of projector (List)')
+                        help='hidden layer dimensions of projector')
     parser.add_argument('--p_hidden_layers', type=int, default=2, help='number of hidden layers in projector')
 
-    # metrics (dtw)
-    parser.add_argument('--use_dtw', type=bool, default=False, 
-                        help='the controller of using dtw metric (dtw is time consuming, not suggested unless necessary)')
-    
-    # Augmentation
-    parser.add_argument('--augmentation_ratio', type=int, default=0, help="How many times to augment")
+    # --- metrics (dtw) ---
+    parser.add_argument('--use_dtw', type=bool, default=False,
+                        help='controller for dtw metric')
+
+    # --- augmentation ---
+    parser.add_argument('--augmentation_ratio', type=int, default=0, help="augmentation multiplier")
     parser.add_argument('--seed', type=int, default=2021, help="Randomization seed")
     parser.add_argument('--jitter', default=False, action="store_true", help="Jitter preset augmentation")
     parser.add_argument('--scaling', default=False, action="store_true", help="Scaling preset augmentation")
@@ -135,13 +186,13 @@ if __name__ == '__main__':
     parser.add_argument('--dtwwarp', default=False, action="store_true", help="DTW warp preset augmentation")
     parser.add_argument('--shapedtwwarp', default=False, action="store_true", help="Shape DTW warp preset augmentation")
     parser.add_argument('--wdba', default=False, action="store_true", help="Weighted DBA preset augmentation")
-    parser.add_argument('--discdtw', default=False, action="store_true", help="Discrimitive DTW warp preset augmentation")
-    parser.add_argument('--discsdtw', default=False, action="store_true", help="Discrimitive shapeDTW warp preset augmentation")
+    parser.add_argument('--discdtw', default=False, action="store_true", help="Discriminative DTW warp preset augmentation")
+    parser.add_argument('--discsdtw', default=False, action="store_true", help="Discriminative shapeDTW warp preset augmentation")
     parser.add_argument('--extra_tag', type=str, default="", help="Anything extra")
-      
-    # TimeXer
+
+    # --- TimeXer ---
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
-    
+
     args = parser.parse_args()
 
     seed = args.seed
@@ -149,12 +200,12 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
     print('Seed:', seed)
-    print('GPU available',torch.cuda.is_available())
+    print('GPU available', torch.cuda.is_available())
     args.use_gpu = True if torch.cuda.is_available() else False
     if args.use_gpu:
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.cuda.set_per_process_memory_fraction(0.9, device=0)  # Optional to set memory fraction
+        torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
     print(torch.cuda.is_available())
 
@@ -166,7 +217,7 @@ if __name__ == '__main__':
 
     print('Args in experiment:')
     print_args(args)
-    
+
     print('Task:', args.task_name)
 
     if args.task_name == 'long_term_forecast':
@@ -174,7 +225,6 @@ if __name__ == '__main__':
     elif args.task_name == 'short_term_forecast':
         print('Short Term Forecast')
         Exp = Exp_Short_Term_Forecast
-
     elif args.task_name == 'imputation':
         Exp = Exp_Imputation
     elif args.task_name == 'anomaly_detection':
@@ -184,7 +234,7 @@ if __name__ == '__main__':
     else:
         Exp = Exp_Long_Term_Forecast
     print('Exp:', Exp)
- 
+
     ii = 0
     setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_noSkip{}_FDC{}_{}_{}'.format(
         args.task_name,
@@ -205,50 +255,50 @@ if __name__ == '__main__':
         args.factor,
         args.embed,
         args.distil,
-        args.des, 
+        args.des,
         args.no_skip,
         args.fuse_decoder,
         args.decoder_type,
         args.seed)
     mse, mae = 0., 0.
     args.no_zero_norm = True
-    exp = Exp(args)  # set experiments
- 
-    # Force correct data path for Weather dataset
-    if args.data == 'custom':
-        exp.args.data_path = 'weather.csv'
-        exp.args.root_path = './data/weather/'
+    exp = Exp(args)
+
+    if args.data == 'custom' and not args.extra_tag == 'synthetic':
+        args.root_path = './data/weather/'
+        args.data_path = 'weather.csv'
         print(f"Setting data path to: {exp.args.root_path}{exp.args.data_path}")
 
-    print('device:', exp.device)    
+    print('device:', exp.device)
     print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
     print('loading model')
-    
-    # Find the correct checkpoint folder automatically
-    if args.data == "custom":
-        checkpoint_base = f"long_term_forecast_{args.model_id}_{args.model}_Weather_{args.pred_len}_{args.model}_custom"
-    else:
-        checkpoint_base = f"long_term_forecast_{args.model_id}_{args.model}_{args.data}_{args.pred_len}_{args.model}_{args.data}"
 
-    # List all folders and find the matching one
+    checkpoint_prefixes = []
+
+    if args.task_name == 'long_term_forecast' and args.data == 'custom':
+        synthetic_prefix = build_synthetic_checkpoint_prefix(args)
+        if synthetic_prefix:
+            checkpoint_prefixes.append(synthetic_prefix)
+
+    checkpoint_prefixes.append(f"{args.task_name}_{args.model_id}_{args.model}")
+
     matching_folders = []
     if os.path.exists(exp.args.checkpoints):
-        for folder in os.listdir(exp.args.checkpoints):
-            if folder.startswith(checkpoint_base):
+        for folder in sorted(os.listdir(exp.args.checkpoints)):
+            if any(folder.startswith(pref) for pref in checkpoint_prefixes):
                 matching_folders.append(folder)
 
-    if matching_folders:
-        actual_setting = matching_folders[0]
-        print(f"Found matching folder: {actual_setting}")
-        checkpoint_file = os.path.join(exp.args.checkpoints, actual_setting, 'checkpoint.pth')
-        print(f"Loading from: {checkpoint_file}")
-        exp.model.load_state_dict(torch.load(checkpoint_file, map_location=exp.device))
-    else:
+    if not matching_folders:
         print("No matching folder found. Available folders:")
-        for folder in os.listdir(exp.args.checkpoints):
-            if f"{args.model}_{args.data}" in folder and f"pl{args.pred_len}" in folder:
-                print(f"  - {folder}")
+        for folder in sorted(os.listdir(exp.args.checkpoints)):
+            print(f"  - {folder}")
         exit(1)
+
+    actual_setting = matching_folders[0]
+    checkpoint_file = os.path.join(exp.args.checkpoints, actual_setting, 'checkpoint.pth')
+    print(f"Found matching folder: {actual_setting}")
+    print(f"Loading from: {checkpoint_file}")
+    exp.model.load_state_dict(torch.load(checkpoint_file, map_location=exp.device))
 
     exp.model = exp.model.to(exp.device)
     exp.model.eval()
@@ -258,63 +308,61 @@ if __name__ == '__main__':
 
     preds = []
     trues = []
-    
 
     eye_mask = torch.eye(args.enc_in).to(exp.device)
     cross_mi_mt = 0.
 
     with torch.no_grad():
         for i, data_batch in enumerate(test_loader):
-            
-            batch_x,batch_y, batch_x_mark, dec_inp, batch_y_mark = exp.prepare_batch(data_batch)        
 
-            seq_indices = torch.arange(args.seq_len,device=exp.device).view(1, 1, args.seq_len, 1).expand(batch_x.shape[0], args.enc_in, -1, args.enc_in)  # Shape: [N, F, L, F]
+            batch_x, batch_y, batch_x_mark, dec_inp, batch_y_mark = exp.prepare_batch(data_batch)
 
-            # Create a mask to identify positions where the feature index equals the last dimension index
-            # This mask will be True where we need to apply the permutation
-            feature_indices = torch.arange(args.enc_in,device=exp.device).view(1, args.enc_in, 1, 1).expand(batch_x.shape[0], -1, args.seq_len, args.enc_in)
-            feature_indices_last = torch.arange(args.enc_in,device=exp.device).view(1, 1, 1, args.enc_in).expand(batch_x.shape[0], args.enc_in, args.seq_len, -1)
-            mask = feature_indices == feature_indices_last  # Shape: [N, F, L, F]
+            seq_indices = torch.arange(args.seq_len, device=exp.device).view(1, 1, args.seq_len, 1).expand(batch_x.shape[0], args.enc_in, -1, args.enc_in)
+
+            feature_indices = torch.arange(args.enc_in, device=exp.device).view(1, args.enc_in, 1, 1).expand(batch_x.shape[0], -1, args.seq_len, args.enc_in)
+            feature_indices_last = torch.arange(args.enc_in, device=exp.device).view(1, 1, 1, args.enc_in).expand(batch_x.shape[0], args.enc_in, args.seq_len, -1)
+            mask = feature_indices == feature_indices_last
             mask = mask.to(exp.device)
-            
-            expanded_shape = [batch_x.shape[0],args.enc_in,args.seq_len,args.enc_in]
-            rp1 = torch.zeros(expanded_shape,device=exp.device)
-            rp2 = torch.randn(expanded_shape,device=exp.device)
-            rp3 = batch_x.unsqueeze(1).expand(-1, args.enc_in, -1, -1)        
-            rp4 = 0.5 * torch.randn(expanded_shape,device=exp.device) + 0.5 * rp3
-            rp5 = 0.1 * torch.randn(expanded_shape,device=exp.device) + 0.9 * rp3
 
-            batch_x_mark_expand = batch_x_mark.unsqueeze(1).expand(-1, args.enc_in, -1, -1)   
+            expanded_shape = [batch_x.shape[0], args.enc_in, args.seq_len, args.enc_in]
+            rp1 = torch.zeros(expanded_shape, device=exp.device)
+            rp2 = torch.randn(expanded_shape, device=exp.device)
+            rp3 = batch_x.unsqueeze(1).expand(-1, args.enc_in, -1, -1)
+            rp4 = 0.5 * torch.randn(expanded_shape, device=exp.device) + 0.5 * rp3
+            rp5 = 0.1 * torch.randn(expanded_shape, device=exp.device) + 0.9 * rp3
+
+            batch_x_mark_expand = batch_x_mark.unsqueeze(1).expand(-1, args.enc_in, -1, -1)
             batch_x_mark_expand = batch_x_mark_expand.reshape(batch_x.shape[0] * args.enc_in, args.seq_len, batch_x_mark.shape[-1])
 
-            dec_inp = dec_inp.unsqueeze(1).expand(-1, args.enc_in, -1, -1) 
+            dec_inp = dec_inp.unsqueeze(1).expand(-1, args.enc_in, -1, -1)
             dec_inp = dec_inp.reshape(batch_x.shape[0] * args.enc_in, dec_inp.shape[-2], dec_inp.shape[-1])
 
-            batch_y_mark = batch_y_mark.unsqueeze(1).expand(-1, args.enc_in, -1, -1)  
-            batch_y_mark = batch_y_mark.reshape(batch_x.shape[0] * args.enc_in, batch_y_mark.shape[-2], batch_y_mark.shape[-1])  
-            
-            new_outputs = torch.empty(5,batch_x.shape[0] * args.enc_in, args.pred_len, args.enc_in,device=exp.device)
+            batch_y_mark = batch_y_mark.unsqueeze(1).expand(-1, args.enc_in, -1, -1)
+            batch_y_mark = batch_y_mark.reshape(batch_x.shape[0] * args.enc_in, batch_y_mark.shape[-2], batch_y_mark.shape[-1])
+
+            new_outputs = torch.empty(5, batch_x.shape[0] * args.enc_in, args.pred_len, args.enc_in, device=exp.device)
             with torch.no_grad():
-                for n,rp in enumerate([rp1,rp2, rp3,rp4,rp5]):
-                    x_replaced = replace_each_feature(batch_x,rp,mask=mask,device=exp.device)
+                for n, rp in enumerate([rp1, rp2, rp3, rp4, rp5]):
+                    x_replaced = replace_each_feature(batch_x, rp, mask=mask, device=exp.device)
 
                     rp_inputs = x_replaced.view(batch_x.shape[0] * args.enc_in, args.seq_len, args.enc_in)
-                    new_outputs[n] = exp.model(rp_inputs,batch_x_mark_expand,dec_inp,batch_y_mark)
+                    new_outputs[n] = exp.model(rp_inputs, batch_x_mark_expand, dec_inp, batch_y_mark)
 
-            tot = torch.std(new_outputs,dim=0)
-            tot = tot.reshape(batch_x.shape[0],args.enc_in,args.pred_len,args.enc_in)
+            tot = torch.std(new_outputs, dim=0)
+            tot = tot.reshape(batch_x.shape[0], args.enc_in, args.pred_len, args.enc_in)
             sdv = tot.mean(dim=0).mean(dim=1)
             self_mi += (sdv * eye_mask).sum()/sdv.shape[0]
             cross_mi += (sdv * (1-eye_mask)).sum()/(sdv.shape[0]*(sdv.shape[0]-1))
             cross_mi_mt += (sdv * (1-eye_mask))
+
     cross_mi_mt /= (i+1)
-    max_cross_mi = (cross_mi_mt * (1-eye_mask)).max()        
-    self_mi/=(i+1)
-    cross_mi/=(i+1)
-    print('iters',i+1,'Self MI:', self_mi, 'Cross MI:', cross_mi,'max cross MI', max_cross_mi)
-    
-    with open('./eval_results/mi_results.txt','a') as f:
+    max_cross_mi = (cross_mi_mt * (1-eye_mask)).max()
+    self_mi /= (i+1)
+    cross_mi /= (i+1)
+    print('iters', i+1, 'Self MI:', self_mi, 'Cross MI:', cross_mi, 'max cross MI', max_cross_mi)
+
+    with open('./eval_results/mi_results.txt', 'a') as f:
         f.write(setting + "  \n")
-        f.write('self_mi:{},cross_mi:{},mse:{},mae:{},max_cross_mi:{}\n'.format(self_mi,cross_mi,mse,mae,max_cross_mi))
-    
+        f.write('self_mi:{},cross_mi:{},mse:{},mae:{},max_cross_mi:{}\n'.format(self_mi, cross_mi, mse, mae, max_cross_mi))
+
     torch.cuda.empty_cache()
